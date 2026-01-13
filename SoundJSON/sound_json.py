@@ -10,6 +10,7 @@ import base64
 import json
 from pydub import AudioSegment
 from sf2utils.sf2parse import Sf2File
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import filecmp
 #from pedalboard import *
 
@@ -24,12 +25,17 @@ def toFile(outFilename, outjson):
     #outFilename = os.path.join(*v["path"]) + ".json"
     directory = os.path.dirname(outFilename)
 
-    fillIn(outjson)
-    outjson = json.dumps(outjson, indent=2)
+    outjson = json.dumps(outjson, indent=2, sort_keys=True)
     os.makedirs(directory, exist_ok=True)
     with open(outFilename, 'w+') as f:
         f.write(outjson)
     print(f"wrote {outFilename}")
+
+
+def sanitize_filename(name):
+    safe_chars = "-_.() "
+    sanitized = "".join(c if c.isalnum() or c in safe_chars else "_" for c in name).strip()
+    return sanitized or "instrument"
 
 def convertFile(infilename, compress=True, force=False, stopOnFail=True):
     soundJSON = {}
@@ -39,13 +45,13 @@ def convertFile(infilename, compress=True, force=False, stopOnFail=True):
         for f in os.listdir(infilename):
             fullfilename = os.path.join(infilename, f)
             try:
-                convertFile(fullfilename, compress=compress)
+                convertFile(fullfilename, compress=compress, force=force)
             except:
                 print("Not Successful")
     
     file_extensions = {
-        "sf2": sf22soundJson,
-        "sfz": sfz2soundJson,
+        "sf2": lambda f, compress, force: sf22soundJson(f, compress=compress, force=force),
+        "sfz": lambda f, compress, force: sfz2soundJson(f, compress=compress),
         #"pkl": lambda f: pickle.load(open(f, "rb")),
         #"json": lambda f: json.loads(open(f, "r").read()),
     }
@@ -55,94 +61,79 @@ def convertFile(infilename, compress=True, force=False, stopOnFail=True):
         return {}
 
     print("processing " + infilename)
-    soundJSON = file_extensions[ext](infilename, compress=compress)
+    soundJSON = file_extensions[ext](infilename, compress=compress, force=force)
     return soundJSON
 
-def find_nearest(theList, x):
-    nearest = min(theList, key=lambda num: abs(num - x))
-    return nearest
-
-def midi_note_to_frequency_multiplier(src, dst):
-    distance = dst - src
-    multiplier = 2 ** (distance / 12)
-    return multiplier
-
-def fillIn(soundJSON, keyCount = 128):
-    for inst, instrumentJSON in soundJSON.items():
-        extantKeys = []
-        key2samples = instrumentJSON["key2samples"]
-
-        # get extant references
-        for keycenter in range(128):
-            if key2samples[keycenter]:
-                extantKeys += [keycenter]
-        
-        if not len(extantKeys):
-            print("No Keys!")
-            return
-
-        for keycenter in range(keyCount):
-            if not key2samples[keycenter]:
-                nearestKey = find_nearest(extantKeys, keycenter)
-                for sampleReference in key2samples[nearestKey]:
-                    newDict = json.loads(json.dumps(sampleReference)) # to create an independant dict object
-                    newDict["keyTrigger"] = keycenter
-                    newDict["pitchBend"] = midi_note_to_frequency_multiplier(dst=keycenter, src=nearestKey)
-                    referencedSampleNo = newDict["sampleNo"]
-                    newDict["targetKeyCenter"] = instrumentJSON["samples"][referencedSampleNo]["pitch_keycenter"]
-                    key2samples[keycenter] += [newDict]
-
-def sf22soundJson(inFilename, compress = True, keyCount = 128):
+def sf22soundJson(inFilename, compress = True, keyCount = 128, force=False):
 
     with open(inFilename, "rb") as sf2_file:
         sf2 = Sf2File(sf2_file)
-        newdir = inFilename[:-4]
-        filename_noext = inFilename[:-4]
-        os.makedirs(newdir, exist_ok=True)
-    
-        for sf2inst in sf2.instruments:
-            outFilename = inFilename[:-4] + ".json"
-            if os.path.exists(outFilename):
-                continue
+        filename_noext = os.path.splitext(inFilename)[0]
+        os.makedirs(filename_noext, exist_ok=True)
+        if not force:
+            existing_files = sorted(
+                f for f in os.listdir(filename_noext) if f.endswith(".json")
+            )
+            if existing_files:
+                patches = {}
+                for json_file in existing_files:
+                    path = os.path.join(filename_noext, json_file)
+                    print("Reading " + path)
+                    with open(path, 'r') as f:
+                        patches.update(json.load(f))
+                return patches
 
+        instruments = []
+        name_counts = {}
+        for sf2inst in sf2.instruments:
             if sf2inst.name == "EOI":
                 continue
+            sanitized = sanitize_filename(sf2inst.name)
+            count = name_counts.get(sanitized, 0)
+            unique_name = sanitized if count == 0 else f"{sanitized}_{count}"
+            name_counts[sanitized] = count + 1
+            instruments.append((sf2inst, unique_name))
             print(sf2inst.name)
-            soundJsonDict = {}
 
+        if not instruments:
+            return {}
+
+        def process_instrument(inst, unique_name):
+            soundJsonDict = {}
             soundJsonDict["source"] = "sf2"
-            soundJsonDict["displayName"] = sf2inst.name
-            soundJsonDict["name"] = sf2inst.name
+            soundJsonDict["displayName"] = inst.name
+            soundJsonDict["name"] = inst.name
             soundJsonDict["percussion"] = 0
             soundJsonDict["percussiveSampleIndex"] = 45
             soundJsonDict["loop"] = 0
             soundJsonDict["success"] = True
-            soundJsonDict["path"] = list(os.path.split(filename_noext)) + [sf2inst.name]
-            soundJsonDict["key2samples"] = [[] for _ in range(keyCount)] 
+            soundJsonDict["path"] = list(os.path.split(filename_noext)) + [inst.name]
             soundJsonDict["samples"] = []
-            
-            if hasattr(sf2inst, "bags"):
-                for bag in sf2inst.bags:
+
+            if hasattr(inst, "bags"):
+                for bag in inst.bags:
                     if hasattr(bag, "sample") and bag.sample is not None:
-                        sampleDict = processSf2Sample(sample = bag.sample, soundJsonDict = soundJsonDict, compress=compress)
+                        processSf2Sample(sample=bag.sample, bag=bag, soundJsonDict=soundJsonDict, compress=compress)
 
+            primaryKey = inFilename + "_" + inst.name
+            out_path = os.path.join(filename_noext, f"{unique_name}.json")
+            soundJsonDict["outFilename"] = out_path
+            patch = {primaryKey: soundJsonDict}
+            toFile(out_path, patch)
+            return primaryKey, soundJsonDict
 
-            soundJsonDict["outFilename"] = outFilename
-            primaryKey = inFilename + "_" + sf2inst.name
-            soundJsonDict = {primaryKey: soundJsonDict}
-            soundJSON = json.dumps(soundJsonDict, indent=2)
+        patches = {}
+        max_workers = max(1, min(8, (os.cpu_count() or 1)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_inst = {
+                executor.submit(process_instrument, inst, unique_name): inst.name
+                for inst, unique_name in instruments
+            }
+            for future in as_completed(future_to_inst):
+                primaryKey, soundJsonDict = future.result()
+                patches[primaryKey] = soundJsonDict
+        return patches
 
-            # check if it matches the gold file
-            goldfilename = outFilename + ".gold"
-            if os.path.exists(goldfilename):
-                with open(goldfilename, 'r') as f:
-                    goldtext = f.read()
-                if goldtext != soundJSON:
-                    soundJsonDict[primaryKey]["success"] = False
-
-            toFile(outFilename, soundJsonDict)
-
-                        
 def sfz2soundJson(filename, compress, keyCount = 128, replaceDict = {}):
     print("processing sfz")
 
@@ -186,7 +177,6 @@ def sfz2soundJson(filename, compress, keyCount = 128, replaceDict = {}):
     soundJsonDict["displayName"] = os.path.split(filename)[-1][:-4]
     soundJsonDict["path"] = os.path.split(filename_noext)
     soundJsonDict["success"] = True
-    soundJsonDict["key2samples"] = [[] for _ in range(keyCount)] 
     soundJsonDict["samples"] = []
     soundJsonDict["samplesLoadPoint"] = os.path.dirname(filename)
 
@@ -230,8 +220,6 @@ def sfz2soundJson(filename, compress, keyCount = 128, replaceDict = {}):
                 sampleDict["pitch_keycenter"] = int(sampleDict["pitch_keycenter"])
             except:
                 sampleDict["pitch_keycenter"] = sfzparser.sfz_note_to_midi_key(sampleDict["pitch_keycenter"])
-            referenceDict = {"sampleNo": len(soundJsonDict["samples"]), "pitchBend": 1, "keyTrigger": sampleDict["pitch_keycenter"]}
-            soundJsonDict["key2samples"][sampleDict["pitch_keycenter"]] += [referenceDict]
             soundJsonDict["samples"] += [sampleDict]
 
         elif sectionName in ["global", "master", "group"]:
@@ -244,8 +232,6 @@ def sfz2soundJson(filename, compress, keyCount = 128, replaceDict = {}):
         elif sectionName not in ["comment", "curve", ""]:
             raise Exception(f"Unknown sfz header '{sectionName}'")
 
-    if not soundJsonDict["key2samples"]:
-        raise Exception("Empty key2samples list")
     soundJsonDict = {filename: soundJsonDict}
 
     toFile(outFilename, soundJsonDict)
@@ -321,7 +307,7 @@ def audioProcess(self, sampleData, sample_rate):
     sampleData[:32] *= np.arange(32) / 32
     return sampleData
 
-def processSf2Sample(sample, soundJsonDict, compress):
+def processSf2Sample(sample, bag, soundJsonDict, compress):
 
     # sf2 samples are always 16bit
     y = np.frombuffer(sample.raw_sample_data, dtype=np.int16)
@@ -332,8 +318,10 @@ def processSf2Sample(sample, soundJsonDict, compress):
     else:
         audioData = buffer2wavb64(y, sample.sample_rate)
         audioFormat = "wav"
-    # sometimes the key is given by the sample name
-    pitch_keycenter = int(sample.original_pitch) if hasattr(sample, "original_pitch") else int(sample.name)
+    # Prefer zone root key override when present; fall back to sample header pitch.
+    pitch_keycenter = bag.base_note if bag is not None and bag.base_note is not None else None
+    if pitch_keycenter is None:
+        pitch_keycenter = int(sample.original_pitch) if hasattr(sample, "original_pitch") else int(sample.name)
     sampleDict = dict(
         sampleNo=len(soundJsonDict["samples"]),
         channels = 1,
@@ -359,9 +347,8 @@ def processSf2Sample(sample, soundJsonDict, compress):
         )
 
     sampleDict["samplesLoadPoint"] = ""
-    soundJsonDict["key2samples"][sampleDict["pitch_keycenter"]] += [{"sampleNo": len(soundJsonDict["samples"]), "pitchBend": 1, "keyTrigger": sampleDict["pitch_keycenter"]}]
     soundJsonDict["samples"] += [sampleDict]
 
 if __name__ == "__main__":
     directory = sys.argv[1]
-    masterjson= convertFile(infilename=directory, force=True) # convert everything in this dir
+    masterjson= convertFile(infilename=directory) # convert everything in this dir
