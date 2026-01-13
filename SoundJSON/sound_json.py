@@ -10,6 +10,7 @@ import base64
 import json
 from pydub import AudioSegment
 from sf2utils.sf2parse import Sf2File
+from sf2utils.generator import Sf2Gen
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import filecmp
 #from pedalboard import *
@@ -307,6 +308,46 @@ def audioProcess(self, sampleData, sample_rate):
     sampleData[:32] *= np.arange(32) / 32
     return sampleData
 
+def add_bag_metadata(sampleDict, bag):
+    if bag is None:
+        return
+
+    if bag.key_range is not None:
+        sampleDict["key_range"] = bag.key_range
+    if bag.velocity_range is not None:
+        sampleDict["velocity_range"] = bag.velocity_range
+    if bag.pan is not None:
+        sampleDict["pan"] = bag.pan
+    if bag.reverb_send is not None:
+        sampleDict["reverb_send"] = bag.reverb_send
+    if bag.chorus_send is not None:
+        sampleDict["chorus_send"] = bag.chorus_send
+    if bag.tuning is not None:
+        sampleDict["coarse_tune"] = bag.tuning
+    if bag.fine_tuning is not None:
+        sampleDict["fine_tune"] = bag.fine_tuning
+    if bag.lp_cutoff is not None:
+        sampleDict["lp_cutoff_hz"] = bag.lp_cutoff
+    if bag.midi_key_pitch_influence is not None:
+        sampleDict["scale_tuning"] = bag.midi_key_pitch_influence
+    if bag.volume_envelope_attack is not None:
+        sampleDict["amp_env_attack"] = bag.volume_envelope_attack
+    if bag.volume_envelope_decay is not None:
+        sampleDict["amp_env_decay"] = bag.volume_envelope_decay
+    if bag.volume_envelope_hold is not None:
+        sampleDict["amp_env_hold"] = bag.volume_envelope_hold
+    if bag.volume_envelope_sustain is not None:
+        sampleDict["amp_env_sustain"] = bag.volume_envelope_sustain
+    if bag.volume_envelope_release is not None:
+        sampleDict["amp_env_release"] = bag.volume_envelope_release
+
+    if Sf2Gen.OPER_EXCLUSIVE_CLASS in bag.gens:
+        sampleDict["exclusive_class"] = bag.gens[Sf2Gen.OPER_EXCLUSIVE_CLASS].word
+    if Sf2Gen.OPER_INITIAL_ATTENUATION in bag.gens:
+        attenuation_db = bag.gens[Sf2Gen.OPER_INITIAL_ATTENUATION].attenuation * 10
+        sampleDict["attenuation_db"] = attenuation_db
+
+
 def processSf2Sample(sample, bag, soundJsonDict, compress):
 
     # sf2 samples are always 16bit
@@ -334,16 +375,34 @@ def processSf2Sample(sample, bag, soundJsonDict, compress):
         gain = (2**16)/np.max(y) 
     )
 
+    add_bag_metadata(sampleDict, bag)
+
     if soundJsonDict["percussion"]:
         sampleDict["pitch_keycenter"] = soundJsonDict["percussiveSampleIndex"]
         soundJsonDict["percussiveSampleIndex"] += 1
 
-    if hasattr(sample, "start_loop") and soundJsonDict["loop"]:
+    loop_start = None
+    loop_end = None
+    loop_mode = None
+    loop_enabled = False
+
+    if bag is not None and bag.sample_loop:
+        loop_enabled = True
+        loop_start = bag.cooked_loop_start
+        loop_end = bag.cooked_loop_end
+        loop_mode = "loop_continuous" if bag.sample_loop_on_noteoff else "loop_sustain"
+    elif hasattr(sample, "start_loop") and soundJsonDict["loop"]:
+        loop_enabled = True
+        loop_start = sample.start_loop
+        loop_end = sample.end_loop
+        loop_mode = "loop_continuous"
+
+    if loop_enabled and loop_start is not None and loop_end is not None:
         sampleDict.update(
-            loop_start=sample.start_loop if sample.start_loop < sample.start else sample.start_loop - sample.start,
-            loop_end=sample.end_loop - sample.start if sample.start_loop >= sample.start else sample.end_loop,
+            loop_start=loop_start,
+            loop_end=loop_end,
             loop=1,
-            loop_mode="loop_continuous",
+            loop_mode=loop_mode,
         )
 
     sampleDict["samplesLoadPoint"] = ""
